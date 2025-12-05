@@ -1,305 +1,339 @@
 #!/usr/bin/env pybricks-micropython
 from pybricks.hubs import EV3Brick
-from pybricks.ev3devices import Motor, ColorSensor, UltrasonicSensor
-from pybricks.parameters import Port, Color
+from pybricks.ev3devices import Motor, TouchSensor, ColorSensor, UltrasonicSensor
+from pybricks.parameters import Port, Stop, Direction, Button, Color
+from pybricks.tools import wait, StopWatch
 from pybricks.robotics import DriveBase
-from pybricks.tools import wait
+from collections import deque
 
-# ==============================================================================
-# 1. 설정 및 초기화
-# ==============================================================================
+# [설정] 객체 초기화
 ev3 = EV3Brick()
-
-# 모터 설정
-grap_motor = Motor(Port.C)
-left_motor = Motor(Port.A)
-right_motor = Motor(Port.D)
-
-# 센서 설정
 left_sensor = ColorSensor(Port.S1)
 right_sensor = ColorSensor(Port.S4)
 object_detector = ColorSensor(Port.S2)
 ultra_sensor = UltrasonicSensor(Port.S3)
 
-# 로봇 제어 상수
-WHEEL_DIAMETER = 56
-AXLE_TRACK = 114
-DRIVE_SPEED = 150
-TURN_SPEED = 100
+grab_motor = Motor(Port.C)
+left_motor = Motor(Port.A)
+right_motor = Motor(Port.D)
+robot = DriveBase(left_motor, right_motor, wheel_diameter=56, axle_track=114)
 
-# 라인 트레이싱 설정
-BLACK_THRESHOLD = 25    
-kp = 0.8
+# [상수] 좌표계 (9x5 Grid)
+GRID_W, GRID_H = 9, 5
+N, E, S, W = 1, 2, 3, 4
+DIR_NAME = {1: 'N', 2: 'E', 3: 'S', 4: 'W'}
 
-robot = DriveBase(left_motor, right_motor, wheel_diameter=WHEEL_DIAMETER, axle_track=AXLE_TRACK)
-robot.settings(straight_speed=DRIVE_SPEED, turn_rate=TURN_SPEED)
+# 센서 기준값
+INTERSECTION_LIMIT = 18 
 
-# ==============================================================================
-# 2. 로봇 상태 및 지도 관리
-# ==============================================================================
-DIR_N, DIR_E, DIR_S, DIR_W = 1, 2, 3, 4
+# 튜닝 파라미터
+SPEED = 150        
+KP = 0.6          
+OBJECT_DETECT_DIST = 80   
+GRAB_APPROACH_DIST = 70   
+RECOVERY_DIST = -30
+PUSH_DIST = 100       
 
-NODES = {
-    1: (0, 0), 2: (1, 0), 3: (2, 0),
-    5: (0, 1), 6: (1, 1), 7: (2, 1),
-    9: (0, 2), 10: (1, 2), 11: (2, 2)
-}
+# 상태 변수
+current_x, current_y = 0, 0 
+current_dir = E
+OBSTACLE_NODES = set()
 
-current_x = 0
-current_y = 0
-current_dir = DIR_E
+# --- [기본 함수] ---
 
-# ==============================================================================
-# 3. 유틸리티 함수
-# ==============================================================================
-
-def get_color():
-    """RGB 값을 읽어 빨강/파랑 판별"""
-    rgb = object_detector.rgb()
-    r, g, b = rgb
-    print("RGB Detect: R:{} G:{} B:{}".format(r,g,b))
-    
-    if r > 10 and r > b + 5:
-        return Color.RED
-    elif b > 15 and b > r + 5:
-        return Color.BLUE
-    return None
-
-def grab_object():
-    print("Action: Grab")
-    grap_motor.run_time(500, 1500)
-    wait(500)
-
-def release_object():
-    print("Action: Release")
-    grap_motor.run_time(-500, 1500)
-    wait(500)
-
-def is_intersection():
-    """양쪽 센서가 모두 검은색이면 교차로(라인)"""
+def dual_sensor_line_follow():
     left_val = left_sensor.reflection()
     right_val = right_sensor.reflection()
-    if left_val < BLACK_THRESHOLD and right_val < BLACK_THRESHOLD:
-        return True
-    return False
+    
+    if left_val < 25 and right_val < 25:
+        robot.drive(SPEED, 0)
+        return
 
-# ==============================================================================
-# 4. 주행 함수
-# ==============================================================================
+    error = left_val - right_val
+    turn_rate = KP * error
+    robot.drive(SPEED, turn_rate)
 
-def follow_line_until_event(check_obstacle=True):
+def n_move(n):
     """
-    라인을 따라가다가 교차로를 만나면 멈추고 'INTERSECTION' 반환
+    n칸(점 n개) 이동 함수
+    [수정됨] 이동할 때마다 실시간으로 좌표를 갱신하고 출력합니다.
     """
-    while True:
-        # 1. 교차로 감지
-        if is_intersection():
-            robot.stop()
-            robot.straight(45) # 교차로 중앙 정렬
-            return "INTERSECTION"
-
-        # 2. 물체 감지 (탐색 모드일 때만)
-        if check_obstacle:
-            dist = ultra_sensor.distance()
-            if dist < 80:
+    global current_x, current_y, current_dir
+    
+    robot.drive(SPEED, 0)
+    wait(300) 
+    
+    for _ in range(n):
+        while True:
+            # 1. 물체 감지
+            if ultra_sensor.distance() < OBJECT_DETECT_DIST:
                 robot.stop()
+                # 감지된 시점의 좌표는 아직 갱신 전(이전 점) 상태
                 return "OBJECT"
             
-        # 3. 라인 트레이싱
-        l_val = left_sensor.reflection()
-        r_val = right_sensor.reflection()
+            # 2. 교차로(점) 감지
+            l_ref = left_sensor.reflection()
+            r_ref = right_sensor.reflection()
+            if l_ref < INTERSECTION_LIMIT and r_ref < INTERSECTION_LIMIT:
+                break 
+            
+            # 3. 주행
+            dual_sensor_line_follow()
+            wait(5)
+            
+        # 교차로를 만났으므로 통과 처리
+        robot.drive(SPEED, 0)
         
-        error = l_val - r_val
-        turn_rate = error * kp
-        robot.drive(DRIVE_SPEED, turn_rate)
-        wait(10)
+        # [핵심 수정] 점 하나를 지날 때마다 좌표 업데이트
+        if current_dir == N: current_y -= 1
+        elif current_dir == E: current_x += 1
+        elif current_dir == S: current_y += 1
+        elif current_dir == W: current_x -= 1
+        
+        # [실시간 좌표 출력]
+        ev3.speaker.beep()
+        print("[POS] Passed/Arrived at ({}, {})".format(current_x, current_y))
+        
+        wait(200) # 교차로 완전히 벗어나기
+        
+    robot.stop()
+    robot.straight(-10) # 정지 관성 보정
+    return "ARRIVED"
 
-def turn_absolute(target_dir):
+def grab():
+    ev3.speaker.beep()
+    grab_motor.run_until_stalled(200, then=Stop.COAST, duty_limit=50)
+
+def release():
+    grab_motor.run_until_stalled(-200, then=Stop.COAST, duty_limit=50)
+
+def turn_to(target_dir):
     global current_dir
-    diff = target_dir - current_dir
+    if current_dir == target_dir: return
     
-    if diff == 3: diff = -1
-    elif diff == -3: diff = 1
-    elif diff in [2, -2]: diff = 2
+    diff = (target_dir - current_dir) % 4
+    turn_speed = 100
     
-    angle = 0
-    if diff == 1: angle = 90
-    elif diff == -1: angle = -90
-    elif diff == 2: angle = 180
-    
-    if angle != 0:
-        robot.turn(angle)
-    
+    if diff == 1: 
+        robot.drive(0, turn_speed)
+        wait(300) 
+        while left_sensor.reflection() > INTERSECTION_LIMIT:
+            robot.drive(0, turn_speed)
+            wait(10)
+        robot.stop()
+        
+    elif diff == 3: 
+        robot.drive(0, -turn_speed)
+        wait(300)
+        while right_sensor.reflection() > INTERSECTION_LIMIT:
+            robot.drive(0, -turn_speed)
+            wait(10)
+        robot.stop()
+        
+    elif diff == 2: 
+        robot.turn(180)
+        
     current_dir = target_dir
-    wait(200)
 
-def move_n_grid(n, check_obstacle=True):
-    """
-    n칸(n개의 교차로)만큼 이동.
-    """
-    for _ in range(n):
-        status = follow_line_until_event(check_obstacle)
-        if status == "OBJECT":
-            return "OBJECT"
+def move_between_nodes(target_dir):
+    """노드 간 이동 (2칸 이동)"""
+    global current_x, current_y, current_dir
+    
+    turn_to(target_dir)
+    
+    # 2칸 이동 (n_move 안에서 1칸 갈 때마다 좌표 업데이트 및 출력됨)
+    res = n_move(2)
+    
+    if res == "OBJECT":
+        return "OBJECT"
+
+    # [수정됨] 좌표 업데이트 로직 삭제 (n_move로 이관됨)
+    
     return "ARRIVED"
 
-def move_manhattan(target_node_id, check_obstacle=True):
-    """
-    현재 좌표에서 목표 노드 좌표로 이동 (1번 노드 복귀용)
-    """
-    global current_x, current_y
-    target_x, target_y = NODES[target_node_id]
-    
-    # X축 이동
-    dx = target_x - current_x
-    if dx != 0:
-        wanted_dir = DIR_E if dx > 0 else DIR_W
-        turn_absolute(wanted_dir)
-        status = move_n_grid(abs(dx), check_obstacle)
-        if status == "OBJECT": return "OBJECT"
-        current_x += dx
+def get_color():
+    rgb = object_detector.rgb()
+    r, g, b = rgb
+    if r > 10 and r > b + 8: return Color.RED
+    elif b > 15 and b > r + 10: return Color.BLUE
+    return None
 
-    # Y축 이동
-    dy = target_y - current_y
-    if dy != 0:
-        wanted_dir = DIR_N if dy > 0 else DIR_S
-        turn_absolute(wanted_dir)
-        status = move_n_grid(abs(dy), check_obstacle)
-        if status == "OBJECT": return "OBJECT"
-        current_y += dy
+# --- [로직] BFS 경로 탐색 ---
+
+def bfs_path_find(start_node, target_func):
+    """BFS 최단 경로 탐색"""
+    queue = deque([(start_node, [])])
+    visited = set([start_node])
+    
+    while queue:
+        (cx, cy), path = queue.popleft()
         
-    return "ARRIVED"
+        if target_func(cx, cy):
+            return path
+            
+        # 4방향 탐색
+        neighbors = [(0,-2,N), (2,0,E), (0,2,S), (-2,0,W)]
+        for dx, dy, d in neighbors:
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < GRID_W and 0 <= ny < GRID_H:
+                # [맵 벽 체크] (3,2)와 (3,4)는 막혀있음
+                is_wall = False
+                if (cx == 2 and nx == 4) and (cy == 2 or cy == 4): is_wall = True
+                if (cx == 4 and nx == 2) and (cy == 2 or cy == 4): is_wall = True
+                
+                if not is_wall and (nx, ny) not in visited and (nx, ny) not in OBSTACLE_NODES:
+                    visited.add((nx, ny))
+                    queue.append(((nx, ny), path + [d]))
+    return None
 
-# ==============================================================================
-# 5. [수정됨] 하드코딩 배달 로직 (1번 노드에서 시작)
-# ==============================================================================
+def bfs_search_target(visited_global):
+    """탐색 모드: (2,0) 또는 (4,0) 이상인 영역 중 미방문 노드 찾기"""
+    def target(x, y):
+        # x>=4 (탐색 격자) 이거나 x==2 (복도) 중 방문 안 한 곳
+        return x >= 2 and (x, y) not in visited_global and (x, y) not in OBSTACLE_NODES
+    return bfs_path_find((current_x, current_y), target)
 
-def deliver_hardcoded(color_type):
-    """
-    1번 노드에 도착한 상태에서 실행됩니다.
-    무조건 정해진 순서(하드코딩)대로 움직여서 배달합니다.
-    """
-    print("Status: Hardcoded Delivery Start -> " + color_type)
+# --- [로직] 하드코딩 배달 ---
+
+def deliver(color):
+    """복귀 및 배달 함수"""
+    global current_x, current_y, current_dir
     
-    # --------------------------------------------------------------------------
-    # 단계 1: 1번 노드 -> 복도 진입 (공통 동작)
-    # --------------------------------------------------------------------------
-    # 1. 서쪽(Start/Zone 방향)을 바라봅니다.
-    turn_absolute(DIR_W)
+    print("[RETURN] Returning to Split Point (2,0)...")
     
-    # 2. 한 칸 전진하여 그리드를 빠져나갑니다. (Start영역 옆 도착)
-    print("Step 1: Exit Grid (Move 1 block West)")
-    move_n_grid(1, check_obstacle=False)
+    # 1. [현장 수습]
+    robot.straight(RECOVERY_DIST) 
     
-    # --------------------------------------------------------------------------
-    # 단계 2: 남쪽으로 회전 (공통 동작)
-    # --------------------------------------------------------------------------
-    print("Step 2: Face South")
-    turn_absolute(DIR_S) 
+    # [수정됨] 180도 회전을 'turn_to' 함수로 처리하여 방향 변수 자동 동기화
+    # 현재 방향의 반대 방향 계산: (dir + 2 - 1) % 4 + 1
+    # 예: E(2) -> W(4), S(3) -> N(1)
+    opposite_dir = (current_dir + 1) % 4 + 1
+    turn_to(opposite_dir) 
+    ev3.speaker.beep()
+    print("[POS] Recovery Turn Complete. Now Facing: {}".format(DIR_NAME[current_dir]))
     
-    # --------------------------------------------------------------------------
-    # 단계 3: 색상별 층수 이동 (분기)
-    # --------------------------------------------------------------------------
-    if color_type == 'Red':
-        print("Step 3 (Red): Go 1 block South")
-        # 빨강은 Start 바로 아래 -> 1칸 이동
-        move_n_grid(1, check_obstacle=False)
+    # 2. [BFS 복귀] 분기점(2,0)으로 이동
+    path_to_split = bfs_path_find((current_x, current_y), lambda x, y: x==2 and y==0)
+    
+    if path_to_split is None:
+        ev3.speaker.say("No Path")
+        return
+
+    for d in path_to_split:
+        res = move_between_nodes(d)
+        if res == "OBJECT":
+            ev3.speaker.say("Error")
+            break
+            
+    print("[POS] Arrived at Split Point (2,0)")
+    ev3.speaker.beep()
+    
+    # 3. [배달] 하드코딩
+    turn_to(S)
+    robot.stop(); wait(500)
+    
+    if color == Color.RED:
+        print("[DELIVER] RED -> (0,2)")
+        n_move(2)
+        turn_to(W); release()
+        robot.straight(PUSH_DIST); robot.straight(-PUSH_DIST)
+        turn_to(N); n_move(2)
         
-    elif color_type == 'Blue':
-        print("Step 3 (Blue): Go 2 blocks South")
-        # 파랑은 빨강보다 더 아래 -> 2칸 이동
-        move_n_grid(2, check_obstacle=False)
+    elif color == Color.BLUE:
+        print("[DELIVER] BLUE -> (0,4)")
+        n_move(4)
+        turn_to(W); release()
+        robot.straight(PUSH_DIST); robot.straight(-PUSH_DIST)
+        turn_to(N); n_move(4)
         
-    # --------------------------------------------------------------------------
-    # 단계 4: 서쪽 회전 후 방 안으로 진입
-    # --------------------------------------------------------------------------
-    print("Step 4: Turn West and Enter Zone")
-    turn_absolute(DIR_W) # 방 쪽을 바라봄
-    
-    # [중요] 방 안으로 들어갈 때는 'move_n_grid' 대신 'robot.straight'를 추천합니다.
-    # 방 안에는 멈출 수 있는 교차로(검은선)가 없을 수도 있기 때문입니다.
-    # 요청하신 "한 Grid 직진"을 거리(20cm 정도)로 환산하여 진입합니다.
-    robot.straight(200) 
-    
-    # --------------------------------------------------------------------------
-    # 단계 5: 내려놓고 복귀
-    # --------------------------------------------------------------------------
-    print("Step 5: Release and Retreat")
-    release_object()     
-    robot.straight(-200)  # 들어온 만큼 뒤로 나옴
-    
-    # 다음 동작을 위해 다시 동쪽(복도) 방향을 바라봄 (선택사항)
-    turn_absolute(DIR_E)
+    else: 
+        print("[DELIVER] Unknown -> RED")
+        n_move(2)
+        turn_to(W); release()
+        robot.straight(PUSH_DIST); robot.straight(-PUSH_DIST)
+        turn_to(N); n_move(2)
 
-# ==============================================================================
-# 6. 메인 실행
-# ==============================================================================
+    # 4. [상태 재설정]
+    current_x, current_y = 2, 0
+    turn_to(E)
+    print("[STATUS] Ready at (2,0)")
 
+# --- [메인] ---
+release()
 def main():
     global current_x, current_y, current_dir
-    ev3.speaker.beep()
-    print("System Started")
+    visited = set()
+    ev3.speaker.say("Start")
     
-    # 시작점 -> 1번 노드 진입
-    follow_line_until_event(check_obstacle=True)
-    follow_line_until_event(check_obstacle=True)
+    # 1. 초기 진입: Start(0,0) -> 분기점(2,0)
+    print("[INIT] Moving to Split Point (2,0)")
+    n_move(2) # 점 2개 이동
+    current_x, current_y = 2, 0
+    visited.add((2, 0))
+    print("[POS] Initialized at (2,0)")
     
-    current_x, current_y = 0, 0
-    current_dir = DIR_E
-    
-    search_list = [1, 2, 3, 5, 6, 7, 9, 10, 11]
-    found_item = None
-    
-    # ------------------------------------------------------------------
-    # 1. 탐색 및 집기
-    # ------------------------------------------------------------------
-    for target in search_list:
-        print("Target Node: {}".format(target))
-        status = move_manhattan(target, check_obstacle=True)
+    while True:
+        # 2. 탐색 경로 계산 (BFS)
+        path = bfs_search_target(visited)
         
-        if status == "OBJECT":
-            print("Status: Object Detected")
-            wait(500)
-            robot.straight(70) # 접근
-            grab_object()      # 집기
-            wait(500)
+        if not path:
+            ev3.speaker.say("End")
+            print("[FINISH] Exploration Complete")
+            break
             
-            detected_color = get_color()
-            if detected_color == Color.RED:
-                found_item = 'Red'
-                print("Color Detected: RED")
-            elif detected_color == Color.BLUE:
-                found_item = 'Blue'
-                print("Color Detected: BLUE")
-            else:
-                found_item = 'Unknown'
-                print("Color Detected: Unknown")
-            
-            break 
-            
-    # ------------------------------------------------------------------
-    # 2. 1번 노드 복귀 -> 하드코딩 배달
-    # ------------------------------------------------------------------
-    if found_item:
-        print("Returning to Hub (Node 1)...")
+        object_found = False
         
-        # [핵심] 어디에 있든 일단 1번 노드(0,0)로 돌아옵니다.
-        move_manhattan(1, check_obstacle=False)
-        
-        # 1번 노드 도착 완료. 이제 하드코딩된 경로로 이동합니다.
-        if found_item == 'Red':
-            deliver_hardcoded('Red')
-        elif found_item == 'Blue':
-            deliver_hardcoded('Blue')
-        else:
-            print("Status: Unknown color, releasing object.")
-            release_object() 
+        # 3. 경로 이동
+        for d in path:
+            res = move_between_nodes(d)
             
-    else:
-        print("Result: Not Found")
-        
-    ev3.speaker.beep()
-    print("System Finished")
+            if res == "OBJECT":
+                object_found = True
+                
+                # 장애물 위치 추정 (현재 위치에서 가려던 방향 2칸 앞)
+                ox, oy = current_x, current_y
+                if d == N: oy -= 2
+                elif d == E: ox += 2
+                elif d == S: oy += 2
+                elif d == W: ox -= 2
+                
+                print("[OBS] Detected at ({}, {})".format(ox, oy))
+                break
+            
+            visited.add((current_x, current_y))
+            
+        # 4. 물체 발견 및 배달
+        if object_found:
+            # 잡기
+            robot.straight(GRAB_APPROACH_DIST)
+            grab()
+            c = get_color()
+            
+            # 잡았으니 장애물이 아님 -> 탐색 대상에서 제외하지 않고 방문 처리 해야 함?
+            # 일단 장애물 리스트에는 넣지 않거나 넣었다 뺌 (여기선 안 넣음)
+            
+            # [복귀] BFS로 분기점(2,0)까지 이동
+            print("[RETURN] Returning to Split Point (2,0)...")
+            
+            # 현장 수습: 뒤로 물러나 180도 회전
+            robot.straight(RECOVERY_DIST)
+            turn_to((current_dir + 2 - 1) % 4 + 1)
+            
+            # (2,0)으로 가는 경로 계산
+            path_to_split = bfs_path_find((current_x, current_y), lambda x, y: x==2 and y==0)
+            
+            if path_to_split:
+                for d in path_to_split:
+                    move_between_nodes(d)
+            
+            print("[POS] Back at Split Point (2,0)")
+            ev3.speaker.beep()
+            
+            # [배달] 하드코딩 실행
+            deliver(c)
+            
+            # 배달 후 (2,0)은 방문 완료
+            visited.add((2, 0))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
